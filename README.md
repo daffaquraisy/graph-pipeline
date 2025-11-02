@@ -32,7 +32,70 @@ This isn't just a simple script; it's a robust, configurable pipeline.
 
 - **Database-First Design:** The pipeline reads all configuration, rules, and mappings directly from the database, making it a "single source of truth."
 
-### 4. Final Graph Schema
+### 4. The `etl_control_db` Architecture
+
+The `etl_control_db` is the "brains" of the entire pipeline. The Python script is _stateless_ and reads all its instructions from this database.
+
+Here is a breakdown of the key configuration tables:
+
+- **`source_databases`**:
+
+  - **Purpose:** A registry of all source databases the ETL _can_ connect to.
+  - **How it's used:** The Python script queries this table at startup. For every database where `is_active = true`, it will fetch the connection details and begin processing.
+
+- **`field_exclusion_rules`**:
+
+  - **Purpose:** A dynamic "blocklist" to prevent sensitive or unnecessary data from entering the graph.
+  - **How it's used:** Before querying a table (e.g., `accounts`), the script fetches all rules for that table. It dynamically builds its `SELECT` statement to _only_ include columns where `is_excluded = false`. This is how PII like `hashed_password` is filtered out.
+
+- **`node_label_mappings`**:
+
+  - **Purpose:** Defines the translation from a SQL table name to a Neo4j node label.
+  - **How it's used:** When the script processes the `accounts` table, it looks it up here and finds it should create nodes with the label `:Account`.
+
+- **`relationship_mappings`**:
+
+  - **Purpose:** This is the most critical table. It defines all the relationships to create _after_ the nodes are loaded.
+  - **How it's used:** The script loops through this table and uses the columns to generate the final Cypher `MATCH...WHERE...CREATE` statements. For example:
+    - `from_label`: `Account`
+    - `to_label`: `PaymentMethod`
+    - `relationship_type`: `HAS_PAYMENT_METHOD`
+    - `join_condition`: `a.account_id = pm.account_id`
+  - This metadata-driven approach means you can add new relationships (even cross-database ones) without ever touching the Python code.
+
+- **`etl_run_logs` & `etl_table_logs`**:
+  - **Purpose:** Provides a complete audit trail of the pipeline's execution.
+  - **How it's used:** The script creates one `etl_run_logs` entry when it starts. It then creates an `etl_table_logs` entry for _every table_ it's about to process. As it completes each table, it updates the row with `status`, `rows_processed`, etc., giving you a granular, real-time view of the pipeline's progress.
+
+### 5. Pipeline Execution Flow (`main.py`)
+
+The `main.py` script acts as the orchestrator, bringing all the components together. It operates in two distinct phases:
+
+#### Phase 1: ETL (The `PostgresToNeo4jETL` Class)
+
+This phase reads from all Postgres sources and generates a single, massive Cypher script.
+
+1.  **Init & Connect:** The `main()` function instantiates `ETLConfig` (from `.env`) and passes it to the `PostgresToNeo4jETL` class. The class connects to the `etl_control_db`.
+2.  **Start Log:** It inserts a new row into `etl_run_logs` to get a `log_id` for this session.
+3.  **Fetch Sources:** It queries the `source_databases` table to get a list of all active databases to process.
+4.  **Loop & Extract Nodes:** It loops through each source database and then loops through each table in that database. For every table (e.g., `profiles_db.accounts`):
+    - It queries `field_exclusion_rules` to dynamically build a `SELECT` statement that _omits_ columns like `hashed_password`.
+    - It queries `node_label_mappings` to find the correct Neo4j label (e.g., `accounts` -> `:Account`).
+    - It extracts all data from the table (e.g., `SELECT account_id, email, full_name... FROM accounts`).
+    - It generates Cypher `CREATE` statements for every row and logs the task to `etl_table_logs`.
+5.  **Generate Relationships:** After all nodes from all sources are generated, it queries the `relationship_mappings` table. It uses this metadata to build the complex, cross-database `MATCH...WHERE...CREATE` statements that connect the nodes.
+6.  **Write File:** It writes all generated Cypher statements (for nodes _and_ relationships) into a single timestamped file (e.g., `graph_output_20251102.cypher`) and registers it in the `cypher_scripts` table.
+
+#### Phase 2: Load (The `Neo4jLoader` Class)
+
+This phase takes the generated script and executes it against Neo4j.
+
+1.  **Init & Connect:** The `main()` function instantiates the `Neo4jLoader` with the Neo4j credentials from the `.env` file. The class connects to your Neo4j Aura instance.
+2.  **Clear Database (Optional):** Because `clear_database=True` is set in `main()`, the loader first runs `MATCH (n) DETACH DELETE n` to wipe the graph clean.
+3.  **Read & Execute:** It reads the `graph_output.cypher` file (passed to it from `main()`), splits its content into a list of individual Cypher statements, and executes them one by one.
+4.  **Update Logs:** Finally, it connects to the `etl_control_db` one last time to update the `cypher_scripts` table with a `last_run_time` to log the successful load.
+
+### 6. Final Graph Schema
 
 The pipeline automatically generates the following graph structure based on the rules in the control database:
 
@@ -72,7 +135,7 @@ The pipeline automatically generates the following graph structure based on the 
 
 - **`(:Account) -[:WATCHED]-> (:PlayEvent)` (Links `profiles_db` to `streaming_db`)**
 
-### 5. The "Payoff": High-Impact Analytical Queries
+### 7. The "Payoff": High-Impact Analytical Queries
 
 With the unified graph, you can now run powerful analytical queries that would crash a SQL server. This list contains the **10 queries that were validated** to return data with the loaded sample set.
 
@@ -284,7 +347,7 @@ RETURN hour_of_day,
 ORDER BY hour_of_day;
 ```
 
-### 6\. How to Run
+### 8\. How to Run
 
 1.  **Setup PostgreSQL:**
 
@@ -331,5 +394,5 @@ ORDER BY hour_of_day;
       4.  Execute the generated Cypher script to build the graph.
 
     - ```bash
-        python main.py
+      python main.py
       ```
